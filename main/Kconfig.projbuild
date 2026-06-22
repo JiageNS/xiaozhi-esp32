@@ -1,5 +1,23 @@
 menu "Xiaozhi Assistant"
 
+config XIAOLU_MODE
+    bool "XiaoLu Recording Mode (小鹿豆录音模式)"
+    default n
+    help
+        Enable XiaoLu recording mode. The device will record audio
+        locally (5-min Opus slices) and upload to OSS when charging.
+        This replaces the real-time voice chat protocol.
+
+config XIAOLU_SERVER_URL
+    depends on XIAOLU_MODE
+    string "XiaoLu Server URL"
+    default "https://xiaolutingyu.xyz/api/device"
+
+config XIAOLU_STORAGE_PATH
+    depends on XIAOLU_MODE
+    string "Recording Storage Path"
+    default "/sdcard/recordings"
+
 config OTA_URL
     string "Default OTA URL"
     default "https://api.tenclass.net/xiaozhi/ota/"

@@ -62,16 +62,28 @@
      (duration_ms) == 100 ? ESP_OPUS_ENC_FRAME_DURATION_100_MS :  \
      (duration_ms) == 120 ? ESP_OPUS_ENC_FRAME_DURATION_120_MS : -1)
 
+#ifdef CONFIG_XIAOLU_MODE
+// 小鹿豆模式：固定 32 kbps + 关 DTX，避免 Opus 把环境录音压成"无声帧"
+#define AS_OPUS_BITRATE_DEFAULT 32000
+#define AS_OPUS_DTX_DEFAULT     false
+#else
+// 其他模式：Opus 自适应码率 + 开 DTX 省带宽（默认行为）
+#define AS_OPUS_BITRATE_DEFAULT ESP_OPUS_BITRATE_AUTO
+#define AS_OPUS_DTX_DEFAULT     true
+#endif
+
 #define AS_OPUS_ENC_CONFIG() {                                                                                    \
         .sample_rate        = ESP_AUDIO_SAMPLE_RATE_16K,                                                          \
         .channel            = ESP_AUDIO_MONO,                                                                     \
         .bits_per_sample    = ESP_AUDIO_BIT16,                                                                    \
-        .bitrate            = ESP_OPUS_BITRATE_AUTO,                                                              \
+        /* 小鹿豆模式：固定 32 kbps + 关 DTX，保证录音清晰、不被静音帧吞细节 */                                    \
+        /* 其他模式（语音助手）：保持 Opus 默认自适应码率 */                                                       \
+        .bitrate            = AS_OPUS_BITRATE_DEFAULT,                                                            \
         .frame_duration     = (esp_opus_enc_frame_duration_t)AS_OPUS_GET_FRAME_DRU_ENUM(OPUS_FRAME_DURATION_MS),  \
         .application_mode   = ESP_OPUS_ENC_APPLICATION_AUDIO,                                                     \
         .complexity         = 0,                                                                                  \
         .enable_fec         = false,                                                                              \
-        .enable_dtx         = true,                                                                               \
+        .enable_dtx         = AS_OPUS_DTX_DEFAULT,                                                                \
         .enable_vbr         = true,                                                                               \
     }
 

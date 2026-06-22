@@ -5,12 +5,19 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 #include <esp_timer.h>
+#include <esp_http_server.h>
+#include <memory>
+
+class DnsServer;
 
 class WifiBoard : public Board {
 protected:
     esp_timer_handle_t connect_timer_ = nullptr;
     bool in_config_mode_ = false;
     NetworkEventCallback network_event_callback_ = nullptr;
+    httpd_handle_t provision_server_ = nullptr;
+    std::string softap_ssid_;
+    std::unique_ptr<DnsServer> dns_server_;
 
     virtual std::string GetBoardJson() override;
 
@@ -35,6 +42,25 @@ protected:
      * WiFi connection timeout callback
      */
     static void OnWifiConnectTimeout(void* arg);
+
+    /**
+     * Start/stop the provisioning API server (port 81) for App communication
+     */
+    void StartProvisioningApi();
+    void StopProvisioningApi();
+
+    /**
+     * Start SoftAP without captive portal (no DNS hijack, no web page)
+     */
+    void StartSoftApOnly();
+    void StopSoftApOnly();
+
+#ifdef CONFIG_XIAOLU_MODE
+    /**
+     * Auto-register device with server after WiFi connects
+     */
+    static void AutoRegisterTask(void* arg);
+#endif
 
 public:
     WifiBoard();

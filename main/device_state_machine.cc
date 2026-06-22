@@ -44,14 +44,21 @@ bool DeviceStateMachine::IsValidTransition(DeviceState from, DeviceState to) con
             return to == kDeviceStateStarting;
 
         case kDeviceStateStarting:
-            // Can go to wifi configuring or activating
+            // Can go to wifi configuring, activating, idle (XiaoLu: waiting for bind),
+            // or listening (XiaoLu: token loaded, start recording directly).
             return to == kDeviceStateWifiConfiguring ||
-                   to == kDeviceStateActivating;
+                   to == kDeviceStateActivating ||
+                   to == kDeviceStateIdle ||
+                   to == kDeviceStateListening;
 
         case kDeviceStateWifiConfiguring:
-            // Can go to activating (after wifi connected) or audio testing
+            // Can go to activating (after wifi connected), audio testing,
+            // listening (XiaoLu: SD-card recording works without WiFi),
+            // or idle (XiaoLu: provisioned but no token yet).
             return to == kDeviceStateActivating ||
-                   to == kDeviceStateAudioTesting;
+                   to == kDeviceStateAudioTesting ||
+                   to == kDeviceStateListening ||
+                   to == kDeviceStateIdle;
 
         case kDeviceStateAudioTesting:
             // Can go back to wifi configuring

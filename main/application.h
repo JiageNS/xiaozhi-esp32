@@ -16,6 +16,9 @@
 #include "audio_service.h"
 #include "device_state.h"
 #include "device_state_machine.h"
+#ifdef CONFIG_XIAOLU_MODE
+#include "xiaolu_heartbeat.h"
+#endif
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -112,6 +115,15 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+
+#ifdef CONFIG_XIAOLU_MODE
+    void InitializeProtocol();
+    Protocol* GetProtocol() { return protocol_.get(); }
+    void StartProtocolAndRecord();
+    void HandleDeviceCommand(const DeviceCommand& cmd);
+    /** Stop heartbeat synchronously (waits for task to exit). Safe to call from main thread. */
+    void StopHeartbeat() { heartbeat_.Stop(); }
+#endif
     
     /**
      * Reset protocol resources (thread-safe)
@@ -135,6 +147,9 @@ private:
     std::string last_error_message_;
     AudioService audio_service_;
     std::unique_ptr<Ota> ota_;
+#ifdef CONFIG_XIAOLU_MODE
+    XiaoLuHeartbeat heartbeat_;
+#endif
 
     bool has_server_time_ = false;
     bool aborted_ = false;
@@ -162,7 +177,9 @@ private:
     // Helper methods
     void CheckAssetsVersion();
     void CheckNewVersion();
+#ifndef CONFIG_XIAOLU_MODE
     void InitializeProtocol();
+#endif
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;

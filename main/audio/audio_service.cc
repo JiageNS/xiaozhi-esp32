@@ -24,9 +24,9 @@
 
 #if CONFIG_USE_AUDIO_PROCESSOR
 #include "processors/afe_audio_processor.h"
-#else
-#include "processors/no_audio_processor.h"
 #endif
+// 小鹿豆模式即使开启了 AFE 也要用 NoAudioProcessor 走纯透传路径，所以始终引入
+#include "processors/no_audio_processor.h"
 
 #if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
 #include "wake_words/afe_wake_word.h"
@@ -92,7 +92,9 @@ void AudioService::Initialize(AudioCodec* codec) {
         }
     }
 
-#if CONFIG_USE_AUDIO_PROCESSOR
+#if CONFIG_USE_AUDIO_PROCESSOR && !defined(CONFIG_XIAOLU_MODE)
+    // 小鹿豆模式：录音设备需要原汁原味的环境音，绕过 AFE 神经网络降噪
+    // 默认 XiaoZhi 模式（语音助手）才走 AFE
     audio_processor_ = std::make_unique<AfeAudioProcessor>();
 #else
     audio_processor_ = std::make_unique<NoAudioProcessor>();

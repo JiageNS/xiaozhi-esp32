@@ -42,6 +42,12 @@ public:
      */
     esp_err_t deinit();
 
+    /**
+     * @brief Safely deinit: if BLE is connected, terminate connection first
+     * and let the disconnect callback handle deinit. If not connected, deinit immediately.
+     */
+    void SafeDeinit();
+
     // Delete copy constructor and assignment operator for singleton
     Blufi(const Blufi &) = delete;
 

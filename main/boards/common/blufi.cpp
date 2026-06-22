@@ -9,8 +9,15 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"
 #include "freertos/task.h"
 #include "wifi_manager.h"
+#include "settings.h"
+
+#ifdef CONFIG_XIAOLU_MODE
+#include "application.h"
+#include "local_storage_protocol.h"
+#endif
 
 #define BLUFI_DEVICE_NAME "Xiaozhi-Blufi"
 
@@ -26,11 +33,6 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "services/gap/ble_svc_gap.h"
-extern void esp_blufi_gatt_svr_register_cb(struct ble_gatt_register_ctxt* ctxt, void* arg);
-extern int esp_blufi_gatt_svr_init(void);
-extern void esp_blufi_gatt_svr_deinit(void);
-extern void esp_blufi_btc_init(void);
-extern void esp_blufi_btc_deinit(void);
 #endif
 
 extern "C" {
@@ -104,6 +106,12 @@ Blufi::~Blufi() {
 
 esp_err_t Blufi::init() {
     esp_err_t ret = ESP_FAIL;
+    // 幂等保护：已经初始化过就直接返回成功，避免重复 init 导致 controller 初始化失败
+    // 进而在 error 分支触发 deinit() 访问悬空指针（Guru Meditation: LoadProhibited）
+    if (inited_) {
+        ESP_LOGW(BLUFI_TAG, "Blufi already initialized, skip re-init");
+        return ESP_OK;
+    }
     inited_ = true;
     m_provisioned = false;
     m_deinited = false;
@@ -146,6 +154,20 @@ esp_err_t Blufi::deinit() {
             return ESP_OK;
         }
         m_deinited = true;
+
+        // If BLE is still connected, terminate the connection first and wait
+        if (m_ble_is_connected) {
+            ESP_LOGW(BLUFI_TAG, "BLE still connected during deinit, terminating...");
+            esp_blufi_disconnect();
+            // Wait for disconnect event to propagate (max 500ms)
+            for (int i = 0; i < 50 && m_ble_is_connected; i++) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            if (m_ble_is_connected) {
+                ESP_LOGE(BLUFI_TAG, "BLE disconnect timed out, proceeding with deinit anyway");
+            }
+        }
+
         ret = _host_deinit();
         if (ret) {
             ESP_LOGE(BLUFI_TAG, "Host deinit failed: %s", esp_err_to_name(ret));
@@ -158,6 +180,20 @@ esp_err_t Blufi::deinit() {
 #endif
     }
     return ret;
+}
+
+void Blufi::SafeDeinit() {
+    if (!inited_ || m_deinited) return;
+
+    if (m_ble_is_connected) {
+        // Mark as provisioned so the disconnect callback will trigger deinit
+        m_provisioned = true;
+        ESP_LOGI(BLUFI_TAG, "SafeDeinit: BLE connected, terminating connection first");
+        esp_blufi_disconnect();
+        // deinit will happen in ESP_BLUFI_EVENT_BLE_DISCONNECT callback
+    } else {
+        deinit();
+    }
 }
 
 #ifdef CONFIG_BT_BLUEDROID_ENABLED
@@ -232,7 +268,7 @@ esp_err_t Blufi::_host_and_cb_init() {
 
 #ifdef CONFIG_BT_NIMBLE_ENABLED
 // Stubs for NimBLE specific store functionality
-void ble_store_config_init();
+extern "C" void ble_store_config_init();
 
 void Blufi::_nimble_on_reset(int reason) {
     ESP_LOGE(BLUFI_TAG, "NimBLE Resetting state; reason=%d", reason);
@@ -262,7 +298,7 @@ esp_err_t Blufi::_host_init() {
     ble_store_config_init();
     esp_blufi_btc_init();
 
-    esp_err_t err = esp_nimble_enable(_nimble_host_task);
+    esp_err_t err = esp_nimble_enable((void*)_nimble_host_task);
     if (err) {
         ESP_LOGE(BLUFI_TAG, "%s failed: %s", __func__, esp_err_to_name(err));
         return ESP_FAIL;
@@ -663,7 +699,26 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
     switch (event) {
         case ESP_BLUFI_EVENT_INIT_FINISH:
             ESP_LOGI(BLUFI_TAG, "BLUFI init finish");
+#ifdef CONFIG_XIAOLU_MODE
+            {
+                uint8_t mac[6];
+                esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                char name[32];
+                snprintf(name, sizeof(name), "XiaoLu-%02X%02X", mac[4], mac[5]);
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+                ble_svc_gap_device_name_set(name);
+#else
+                esp_ble_gap_set_device_name(name);
+#endif
+                ESP_LOGI(BLUFI_TAG, "XiaoLu BLE name: %s", name);
+            }
+#else
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+            ble_svc_gap_device_name_set(BLUFI_DEVICE_NAME);
+#else
             esp_ble_gap_set_device_name(BLUFI_DEVICE_NAME);
+#endif
+#endif
             esp_blufi_adv_start();
             break;
         case ESP_BLUFI_EVENT_DEINIT_FINISH:
@@ -878,23 +933,14 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
             break;
         case ESP_BLUFI_EVENT_GET_WIFI_LIST: {
             ESP_LOGI(BLUFI_TAG, "BLUFI get wifi list");
-            // Case 1: a scan is already in flight (init scan or refresh scan started by
-            // the previous _send_wifi_list()). Defer the response to its done handler
-            // instead of blocking the BluFi task.
             if (m_scan_in_progress) {
                 m_send_list_after_scan = true;
                 break;
             }
-            // Case 2: cache is populated. Respond immediately; _send_wifi_list() also
-            // kicks off an async refresh scan to keep the cache fresh.
             if (!m_ap_records.empty()) {
                 _send_wifi_list();
                 break;
             }
-            // Case 3: no cache (e.g. driver was stopped during a config-mode transition,
-            // init scan never completed). Trigger a real scan and dispatch from the
-            // scan-done handler. If the scan cannot start, return an error frame so the
-            // App exits its wait state instead of timing out.
             m_scan_should_save_ssid = true;
             m_send_list_after_scan = true;
             if (!start_wifi_scan()) {
@@ -903,6 +949,71 @@ void Blufi::_handle_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t* para
             }
             break;
         }
+#ifdef CONFIG_XIAOLU_MODE
+        case ESP_BLUFI_EVENT_RECV_CUSTOM_DATA: {
+            ESP_LOGI(BLUFI_TAG, "Recv custom data, len=%lu", (unsigned long)param->custom_data.data_len);
+            std::string payload(reinterpret_cast<char*>(param->custom_data.data),
+                                param->custom_data.data_len);
+
+            // Command protocol:
+            //   "GET_ID"       → returns "ID:xiaolu_<mac>"
+            //   "TOKEN:<jwt>"  → saves device_token to NVS, replies "TOKEN_OK", starts recording
+            //   (legacy: raw token without prefix still supported for backward compat)
+
+            if (payload == "GET_ID") {
+                uint8_t mac[6] = {0};
+                esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                char id_str[64];
+                snprintf(id_str, sizeof(id_str),
+                         "ID:xiaolu_%02x%02x%02x%02x%02x%02x",
+                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                ESP_LOGI(BLUFI_TAG, "Send device id: %s", id_str);
+                esp_blufi_send_custom_data((uint8_t*)id_str, strlen(id_str));
+                break;
+            }
+
+            std::string token_str;
+            if (payload.rfind("TOKEN:", 0) == 0) {
+                token_str = payload.substr(6);
+            } else {
+                token_str = payload;  // legacy: treat whole payload as token
+            }
+
+            if (token_str.empty()) {
+                const char* err = "ERR:empty_token";
+                esp_blufi_send_custom_data((uint8_t*)err, strlen(err));
+                break;
+            }
+
+            ESP_LOGI(BLUFI_TAG, "Received device_token via BLE, len=%u", (unsigned)token_str.size());
+
+            // Store token to NVS
+            Settings xiaolu_settings("xiaolu", true);
+            xiaolu_settings.SetString("device_token", token_str);
+            ESP_LOGI(BLUFI_TAG, "device_token saved to NVS");
+
+            // Send ACK back to App
+            const char* ack = "TOKEN_OK";
+            esp_blufi_send_custom_data((uint8_t*)ack, strlen(ack));
+
+            // Start recording via Application main task
+            auto& app = Application::GetInstance();
+            app.Schedule([token_str]() {
+                auto& a = Application::GetInstance();
+                if (a.GetDeviceState() == kDeviceStateIdle ||
+                    a.GetDeviceState() == kDeviceStateStarting) {
+                    ESP_LOGI("BLUFI_CLASS", "Starting recording after BLE token received");
+                    a.InitializeProtocol();
+                    auto* proto = static_cast<LocalStorageProtocol*>(a.GetProtocol());
+                    if (proto) {
+                        proto->SetServerConfig(CONFIG_XIAOLU_SERVER_URL, token_str);
+                    }
+                    a.StartProtocolAndRecord();
+                }
+            });
+            break;
+        }
+#endif
         default:
             ESP_LOGW(BLUFI_TAG, "Unhandled event: %d", event);
             break;

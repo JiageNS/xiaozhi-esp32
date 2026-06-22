@@ -29,6 +29,9 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/protocol.cc"
             "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
+            "protocols/local_storage_protocol.cc"
+            "protocols/xiaolu_heartbeat.cc"
+            "protocols/xiaolu_time.cc"
             "mcp_server.cc"
             "system_info.cc"
             "application.cc"
@@ -819,10 +822,10 @@ endif()
 list(APPEND SOURCES ${BOARD_SOURCES})
 
 # Select audio processor according to Kconfig
+# 小鹿豆模式即使开启 AFE 也要编译 NoAudioProcessor（运行时切换为透传），所以始终编译
+list(APPEND SOURCES "audio/processors/no_audio_processor.cc")
 if(CONFIG_USE_AUDIO_PROCESSOR)
     list(APPEND SOURCES "audio/processors/afe_audio_processor.cc")
-else()
-    list(APPEND SOURCES "audio/processors/no_audio_processor.cc")
 endif()
 if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4)
     list(APPEND SOURCES "audio/wake_words/afe_wake_word.cc")
@@ -1000,6 +1003,7 @@ idf_component_register(SRCS ${SOURCES}
                         efuse
                         bt
                         fatfs
+                        esp_http_client
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 

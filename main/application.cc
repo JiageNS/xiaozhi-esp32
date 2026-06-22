@@ -10,6 +10,16 @@
 #include "assets.h"
 #include "settings.h"
 
+#ifdef CONFIG_XIAOLU_MODE
+#include "local_storage_protocol.h"
+#include "xiaolu_heartbeat.h"
+#include "wifi_board.h"
+#include <ssid_manager.h>
+#ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
+#include "blufi.h"
+#endif
+#endif
+
 #include <cstring>
 #include <esp_log.h>
 #include <cJSON.h>
@@ -158,6 +168,48 @@ void Application::Initialize() {
     // Start network asynchronously
     board.StartNetwork();
 
+#ifdef CONFIG_XIAOLU_MODE
+    // 小鹿豆模式：从 NVS 读取 device_token
+    Settings xiaolu_settings("xiaolu", false);
+    std::string device_token = xiaolu_settings.GetString("device_token");
+    
+    if (device_token.empty()) {
+        // 没有 token，等待网络连接后启动 BluFi 配网绑定
+        ESP_LOGW(TAG, "XiaoLu mode: no device_token in NVS, will start BluFi after WiFi connects");
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetStatus("等待绑定");
+    } else {
+        // 有 token，直接开始录音
+        ESP_LOGI(TAG, "XiaoLu mode: token found, initializing recording");
+        InitializeProtocol();
+
+        auto* local_proto = static_cast<LocalStorageProtocol*>(protocol_.get());
+        local_proto->SetServerConfig(CONFIG_XIAOLU_SERVER_URL, device_token);
+        
+        protocol_->Start();
+        protocol_->OpenAudioChannel();
+        audio_service_.EnableVoiceProcessing(true);
+        SetDeviceState(kDeviceStateListening);
+        ESP_LOGI(TAG, "XiaoLu mode: recording started (voice processing enabled)");
+
+        // 启动心跳服务（WebSocket 长连接）
+        heartbeat_.SetServerConfig(CONFIG_XIAOLU_SERVER_URL, device_token);
+        // device_id 格式: xiaolu_ccba9720a0f4 (MAC去冒号)
+        std::string mac = SystemInfo::GetMacAddress();
+        std::string mac_no_colon;
+        for (char c : mac) { if (c != ':') mac_no_colon += c; }
+        heartbeat_.SetDeviceId("xiaolu_" + mac_no_colon);
+        heartbeat_.SetRecording(protocol_ && protocol_->IsAudioChannelOpened());
+        heartbeat_.SetCommandCallback([this](const DeviceCommand& cmd) {
+            // 不在心跳线程里执行任何操作，只推到主循环
+            Schedule([this, cmd]() {
+                HandleDeviceCommand(cmd);
+            });
+        });
+        heartbeat_.Start(3);  // 3 秒轮询
+    }
+#endif
+
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
 }
@@ -253,6 +305,32 @@ void Application::Run() {
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
+
+#ifdef CONFIG_XIAOLU_MODE
+                // 每 10 秒读一次电量，喂给心跳和本地存储（低电量紧急落盘）
+                int battery_level = 100;
+                bool charging = false, discharging = false;
+                if (Board::GetInstance().GetBatteryLevel(battery_level, charging, discharging)) {
+                    heartbeat_.SetBattery(battery_level);
+                    if (protocol_) {
+                        auto* local_proto = static_cast<LocalStorageProtocol*>(protocol_.get());
+                        local_proto->OnBatteryUpdate(battery_level, charging);
+                        // Update SD card storage info for heartbeat
+                        local_proto->UpdateStorageInfo();
+                        heartbeat_.SetStorageUsed(local_proto->GetStorageUsedMb());
+                        heartbeat_.SetStorageTotal(local_proto->GetStorageTotalMb());
+                        // Upload progress
+                        heartbeat_.SetUploadStatus(
+                            local_proto->IsUploading(),
+                            local_proto->GetUploadCurrentFile(),
+                            local_proto->GetUploadTotalFiles(),
+                            local_proto->GetUploadFilePercent()
+                        );
+                    }
+                    // Update recording state
+                    heartbeat_.SetRecording(protocol_ && protocol_->IsAudioChannelOpened());
+                }
+#endif
             }
         }
     }
@@ -262,6 +340,41 @@ void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
     auto state = GetDeviceState();
 
+#ifdef CONFIG_XIAOLU_MODE
+    // 小鹿豆模式：网络连接后检查是否需要注册或启动录音
+    if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
+        Settings xiaolu_settings("xiaolu", false);
+        std::string device_token = xiaolu_settings.GetString("device_token");
+        
+        if (device_token.empty()) {
+#ifdef CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING
+            // 没有 token：启动 BluFi 等待 App 通过 BLE 发送 device_token
+            ESP_LOGW(TAG, "XiaoLu mode: network ready but no token, starting BluFi for binding");
+            Blufi::GetInstance().init();
+#else
+            // 没有 token：等待 App 通过 SoftAP 配网传入 token，或自动注册
+            ESP_LOGW(TAG, "XiaoLu mode: network ready but no token, waiting for provisioning");
+#endif
+            SetDeviceState(kDeviceStateIdle);
+            auto display = Board::GetInstance().GetDisplay();
+            display->SetStatus("等待绑定");
+        } else if (!protocol_) {
+            // 有 token 但还没初始化协议（可能是启动时网络还没好）
+            ESP_LOGI(TAG, "XiaoLu mode: network ready, starting recording with saved token");
+            InitializeProtocol();
+            auto* local_proto = static_cast<LocalStorageProtocol*>(protocol_.get());
+            local_proto->SetServerConfig(CONFIG_XIAOLU_SERVER_URL, device_token);
+            protocol_->Start();
+            protocol_->OpenAudioChannel();
+            audio_service_.EnableVoiceProcessing(true);
+            SetDeviceState(kDeviceStateListening);
+        } else {
+            // 已经在录音了，只是网络重连
+            ESP_LOGI(TAG, "XiaoLu mode: network reconnected, skipping activation");
+            SetDeviceState(kDeviceStateListening);
+        }
+    }
+#else
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
         // Network is ready, start activation
         SetDeviceState(kDeviceStateActivating);
@@ -277,6 +390,7 @@ void Application::HandleNetworkConnectedEvent() {
             vTaskDelete(NULL);
         }, "activation", 4096 * 2, this, 2, &activation_task_handle_);
     }
+#endif
 
     // Update the status bar immediately to show the network state
     auto display = Board::GetInstance().GetDisplay();
@@ -286,13 +400,22 @@ void Application::HandleNetworkConnectedEvent() {
 void Application::HandleNetworkDisconnectedEvent() {
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
+    auto display = Board::GetInstance().GetDisplay();
+
+#ifdef CONFIG_XIAOLU_MODE
+    // 小鹿豆是录音器：断网期间继续录到 SD 卡，回到 WiFi 范围后再批量上传。
+    // 不能因为网络抖动就把麦克风关了 —— 小朋友带出门的整段话都会丢。
+    ESP_LOGI(TAG, "Network disconnected (XiaoLu mode: keep recording to SD)");
+    display->UpdateStatusBar(true);
+    return;
+#endif
+
     if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
         protocol_->CloseAudioChannel();
     }
 
     // Update the status bar immediately to show the network state
-    auto display = Board::GetInstance().GetDisplay();
     display->UpdateStatusBar(true);
 }
 
@@ -477,6 +600,10 @@ void Application::InitializeProtocol() {
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
+#ifdef CONFIG_XIAOLU_MODE
+    ESP_LOGI(TAG, "XiaoLu mode: using LocalStorageProtocol");
+    protocol_ = std::make_unique<LocalStorageProtocol>(CONFIG_XIAOLU_STORAGE_PATH);
+#else
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
     } else if (ota_->HasWebsocketConfig()) {
@@ -485,6 +612,7 @@ void Application::InitializeProtocol() {
         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
         protocol_ = std::make_unique<MqttProtocol>();
     }
+#endif
 
     protocol_->OnConnected([this]() {
         DismissAlert();
@@ -608,6 +736,111 @@ void Application::InitializeProtocol() {
     
     protocol_->Start();
 }
+
+#ifdef CONFIG_XIAOLU_MODE
+void Application::StartProtocolAndRecord() {
+    if (!protocol_) {
+        ESP_LOGE(TAG, "StartProtocolAndRecord: protocol not initialized");
+        return;
+    }
+    protocol_->Start();
+    protocol_->OpenAudioChannel();
+    audio_service_.EnableVoiceProcessing(true);
+    SetDeviceState(kDeviceStateListening);
+    ESP_LOGI(TAG, "XiaoLu: recording started after BLE binding");
+}
+
+void Application::HandleDeviceCommand(const DeviceCommand& cmd) {
+    ESP_LOGI(TAG, "Executing command: %s (id=%d)", cmd.command.c_str(), cmd.id);
+
+    if (cmd.command == "start_recording") {
+        // 自愈：如果 protocol_ 还没建（启动顺序异常），用 NVS 里的 token 即时初始化
+        if (!protocol_) {
+            ESP_LOGW(TAG, "start_recording: protocol_ null, attempting recovery init");
+            Settings xiaolu_settings("xiaolu", false);
+            std::string token = xiaolu_settings.GetString("device_token");
+            if (token.empty()) {
+                ESP_LOGE(TAG, "start_recording: no token in NVS, cannot recover");
+                return;
+            }
+            InitializeProtocol();
+            if (!protocol_) {
+                ESP_LOGE(TAG, "start_recording: InitializeProtocol failed");
+                return;
+            }
+            auto* local_proto = static_cast<LocalStorageProtocol*>(protocol_.get());
+            local_proto->SetServerConfig(CONFIG_XIAOLU_SERVER_URL, token);
+            protocol_->Start();
+        }
+        protocol_->OpenAudioChannel();
+        audio_service_.EnableVoiceProcessing(true);
+        SetDeviceState(kDeviceStateListening);
+        heartbeat_.SetRecording(true);
+        ESP_LOGI(TAG, "Command: recording started");
+    } else if (cmd.command == "stop_recording") {
+        if (protocol_) {
+            protocol_->CloseAudioChannel();
+            audio_service_.EnableVoiceProcessing(false);
+            SetDeviceState(kDeviceStateIdle);
+            heartbeat_.SetRecording(false);
+            ESP_LOGI(TAG, "Command: recording stopped");
+        }
+    } else if (cmd.command == "reboot") {
+        ESP_LOGW(TAG, "Command: rebooting in 2 seconds...");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_restart();
+    } else if (cmd.command == "upload_now") {
+        Schedule([this]() {
+            if (protocol_) {
+                auto* local_proto = static_cast<LocalStorageProtocol*>(protocol_.get());
+                local_proto->FlushAndUpload();
+                ESP_LOGI(TAG, "Command: flush and upload triggered");
+            }
+        });
+    } else if (cmd.command == "enter_config") {
+        // 进配网模式但保留 token + WiFi 凭据（用户只是想换 WiFi）
+        ESP_LOGW(TAG, "Command: entering WiFi config mode (preserve token)");
+        auto* wifi_board = static_cast<WifiBoard*>(&Board::GetInstance());
+        wifi_board->EnterWifiConfigMode();
+    } else if (cmd.command == "unbind") {
+        // 解除绑定：清 token，关录音，立即进 SoftAP 等待新主人
+        // 不擦 WiFi 凭据：万一新用户半天不来，超时回退还能连回家里 WiFi 保持在线
+        ESP_LOGW(TAG, "Command: unbind device, clearing token and entering config mode");
+
+        // 1) Stop recording / heartbeat / protocol
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            protocol_->CloseAudioChannel();
+        }
+        audio_service_.EnableVoiceProcessing(false);
+        heartbeat_.SetRecording(false);
+        heartbeat_.Stop();
+
+        // 2) Clear token in NVS
+        Settings xiaolu_settings("xiaolu", true);
+        xiaolu_settings.EraseKey("device_token");
+        ESP_LOGI(TAG, "device_token cleared from NVS");
+
+        // 3) Reset protocol pointer
+        protocol_.reset();
+
+        // 4) Enter SoftAP immediately (don't restart — user is staring at the screen)
+        auto* wifi_board = static_cast<WifiBoard*>(&Board::GetInstance());
+        wifi_board->EnterWifiConfigMode();
+    } else if (cmd.command == "reset_wifi") {
+        ESP_LOGW(TAG, "Command: resetting WiFi config and entering config mode...");
+        // Clear all saved WiFi credentials
+        SsidManager::GetInstance().Clear();
+        // Also clear legacy settings
+        Settings wifi_settings("wifi", true);
+        wifi_settings.EraseKey("ssid");
+        wifi_settings.EraseKey("password");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    } else {
+        ESP_LOGW(TAG, "Unknown command: %s", cmd.command.c_str());
+    }
+}
+#endif
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
     struct digit_sound {
